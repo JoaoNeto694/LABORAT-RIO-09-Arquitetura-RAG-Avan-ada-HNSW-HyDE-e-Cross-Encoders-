@@ -2,11 +2,13 @@ import time
 import numpy as np
 import faiss
 from google.colab import userdata
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from groq import Groq
 from corpus import CORPUS
 
 # Configurações
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # Hiperparâmetros HNSW
 HNSW_M = 16 # nº máximo de conexões por nó em cada camada
@@ -14,6 +16,8 @@ HNSW_EF_CONSTRUCTION = 64 # qualidade da construção
 HNSW_EF_SEARCH = 32 # qualidade da busca
 
 TOP_K_RETRIEVE = 10 # funil largo (Bi-Encoder)
+TOP_K_FINAL = 3 # funil fino (Cross-Encoder)
+
 
 # PASSO 1 — Indexação HNSW
 def construir_indice_hnsw(corpus, embedder):
@@ -74,3 +78,53 @@ def busca_rapida(doc_hipotetico, embedder, index, k=TOP_K_RETRIEVE):
         print(f"#{rank:>2}  cos={score:+.4f}  doc[{idx:>2}]  {preview}")
     print()
     return resultados
+
+# PASSO 4 — Re-ranking com Cross-Encoder
+def reranquear(query_original, candidatos, cross_encoder, top_n=TOP_K_FINAL):
+    # Prepara os pares (query, doc) para o Cross-Encoder.
+    pares = [(query_original, doc) for (_, _, doc) in candidatos]
+
+    t0 = time.perf_counter()
+    scores = cross_encoder.predict(pares, show_progress_bar=False)
+    dt = (time.perf_counter() - t0) * 1000
+
+    # Rankeia os candidatos com base na pontuação do Cross-Encoder.
+    rankeado = sorted(
+        zip(candidatos, scores),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    # Imprime os resultados finais com as pontuações do Cross-Encoder e do Bi-Encoder.
+    finais = []
+    for rank, ((idx, cos, doc), ce_score) in enumerate(rankeado[:top_n], start=1):
+        finais.append({"idx": idx, "cos": cos, "ce_score": float(ce_score), "doc": doc})
+        print(f"TOP {rank}  doc[{idx}]")
+        print(f"cross-encoder score: {ce_score:+.4f}   |   cosseno (HNSW): {cos:+.4f}")
+        print(f"{doc}\n")
+    return finais
+
+
+# Pipeline orquestrador
+def pipeline(query):
+    embedder = SentenceTransformer(EMBEDDING_MODEL)
+    cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+
+    # Passo 1
+    index = construir_indice_hnsw(CORPUS, embedder)
+
+    # Passo 2 — HyDE
+    doc_hipotetico = gerar_documento_hipotetico(query)
+
+    # Passo 3 — Bi-Encoder + HNSW
+    candidatos = busca_rapida(doc_hipotetico, embedder, index)
+
+    # Passo 4 — Cross-Encoder
+    finais = reranquear(query, candidatos, cross_encoder)
+ 
+    return finais
+
+
+if __name__ == "__main__":
+    QUERY = "dor de cabeça latejante e luz incomodando"
+    pipeline(QUERY)
